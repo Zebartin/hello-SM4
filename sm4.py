@@ -1,4 +1,6 @@
-from typing import List
+import multiprocessing
+from functools import partial
+from typing import Callable, List
 
 import click
 
@@ -49,16 +51,20 @@ SM4_CK = [
 ]
 
 
-def bytes2int(x: bytes):
+def bytes2int(x: bytes) -> int:
+    """bytes转int，方便进行异或等运算"""
     return int.from_bytes(x, 'big')
 
 
-def int2bytes(x: int, n: int = 4):
-    return x.to_bytes(n, 'big')
+def int2bytes(x: int, n: int = 4) -> bytes:
+    """将x取模避免溢出，然后转化为字节表示"""
+    # 这里n表示字节数，左移3位后表示比特数
+    return (x % (1 << (n << 3))).to_bytes(n, 'big')
 
 
-def rtol(x: int, n: int) -> int:
-    return ((x << n) & 0xFFFFFFFF) | ((x >> (32-n)) & 0xFFFFFFFF)
+def rtol(x: int, n: int, m: int = 32) -> int:
+    """m位内的循环左移"""
+    return ((x << n) & 0xFFFFFFFF) | ((x >> (m-n)) & 0xFFFFFFFF)
 
 
 def lowest_byte(x: int) -> int:
@@ -74,6 +80,7 @@ def func_L_prime(x: int) -> int:
 
 
 def func_S(x: int) -> int:
+    """将32位整数放入S盒处理"""
     t = 0
     t |= SM4_SBOX[lowest_byte(x >> 24)] << 24
     t |= SM4_SBOX[lowest_byte(x >> 16)] << 16
@@ -90,7 +97,8 @@ def func_T_prime(x: int) -> int:
     return func_L_prime(func_S(x))
 
 
-def key_schedule(key: bytes):
+def key_schedule(key: bytes) -> List[int]:
+    """SM4的密钥扩展算法"""
     mk = [bytes2int(key[4*i:4*(i+1)]) for i in range(4)]
     rk = [a ^ b for a, b in zip(mk, SM4_FK)]
     for i in range(32):
@@ -99,8 +107,100 @@ def key_schedule(key: bytes):
     return rk[4:]
 
 
-def sm4(m: bytes, rk: List[int]):
+def sm4(m: bytes, rk: List[int]) -> bytes:
+    """SM4密码算法"""
     X = [bytes2int(m[4*i:4*(i+1)]) for i in range(4)]
     for i in range(32):
         X.append(X[i] ^ func_T(X[i+1] ^ X[i+2] ^ X[i+3] ^ rk[i]))
+    # 取X的最后4个，并逆序拼接起来
     return b''.join([int2bytes(x) for x in X[:-5:-1]])
+
+
+def padding(m: bytes) -> bytes:
+    """ECB的padding"""
+    l = 16 - len(m) % 16
+    return m + b''.join([int2bytes(l, 1) for _ in range(l)])
+
+
+def unpadding(m: bytes) -> bytes:
+    """ECB去除padding"""
+    return m[:-m[-1]]
+
+
+def sm4_ecb_(m: bytes, rk: List[int]) -> bytes:
+    """ECB核心流程，不包括padding"""
+    sm4p = partial(sm4, rk=rk)
+    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as p:
+        return b''.join(p.map(sm4p, [m[16*i:16*(i+1)]
+                        for i in range(len(m) // 16)]))
+
+
+def sm4_ctr_round(m_round: bytes, rk: List[int], iv_round: bytes) -> bytes:
+    """CTR每轮对block的计算"""
+    l = len(m_round)
+    t = sm4(int2bytes(iv_round, 16), rk)[:l]
+    return int2bytes(bytes2int(m_round) ^ bytes2int(t), l)
+
+
+def sm4_ctr_(m: bytes, rk: List[int], iv: int) -> bytes:
+    """CTR核心流程"""
+    with multiprocessing.Pool(processes=multiprocessing.cpu_count()) as p:
+        return b''.join(p.starmap(sm4_ctr_round,
+                        [(m[16*i:16*(i+1)], rk, iv+i) for i in range(len(m) // 16)]))
+
+
+def fix_hex_str(x: str, func: Callable) -> str:
+    """对用户输入的hex字符串进行处理"""
+    if len(x) < 32:
+        click.echo('hex string is too short, padding with zero bytes to length')
+        x += ''.join(['0']*(32-len(x)))
+    elif len(x) > 32:
+        click.echo('hex string is too long, ignoring excess')
+        x = x[:32]
+    try:
+        return func(x)
+    except ValueError:
+        click.echo('non-hex digit')
+        raise click.UsageError('invalid hex key value')
+
+
+def fix_key(key: str) -> bytes:
+    return fix_hex_str(key, lambda x: bytes.fromhex(x))
+
+
+def fix_iv(iv: str) -> int:
+    return fix_hex_str(iv, lambda x: int(x, 16))
+
+
+@click.group()
+def cli():
+    pass
+
+
+@cli.command()
+@click.option('-e/-d', 'encrypt', required=True, default=None, help='Encrypt/decrypt')
+@click.option('-in', 'in_file', required=True, type=click.File(mode='rb'), help='Input file')
+@click.option('-out', 'out_file', required=True, type=click.File(mode='wb'), help='Output file')
+@click.option('-K', 'key', required=True, type=str, help='Raw key, in hex')
+def sm4_ecb(encrypt, key, in_file, out_file):
+    in_bytes = in_file.read()
+    rk = key_schedule(fix_key(key))
+    if encrypt:
+        res = sm4_ecb_(padding(in_bytes), rk)
+    else:
+        res = unpadding(sm4_ecb_(in_bytes, rk[::-1]))
+    out_file.write(res)
+
+
+@cli.command()
+@click.option('-e/-d', 'encrypt', required=True, default=None, help='Encrypt/decrypt')
+@click.option('-in', 'in_file', required=True, type=click.File(mode='rb'), help='Input file')
+@click.option('-out', 'out_file', required=True, type=click.File(mode='wb'), help='Output file')
+@click.option('-K', 'key', required=True, type=str, help='Raw key, in hex')
+@click.option('-iv', required=True, type=str, help='IV in hex')
+def sm4_ctr(encrypt, key, iv, in_file, out_file):
+    out_file.write(sm4_ctr_(
+        in_file.read(),
+        key_schedule(fix_key(key)),
+        fix_iv(iv)
+    ))
